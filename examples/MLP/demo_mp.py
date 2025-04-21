@@ -23,6 +23,20 @@ from mup import MuSGD, get_shapes, set_base_shapes, make_base_shapes, MuReadout
     This is minimal notebook that demonstrates the hyperparameter stability of muP.
 '''
 
+def chunk_jobs(jobs, n_chunks):
+    """Split a list of jobs into n_chunks as evenly as possible with no jobs left out."""
+    chunk_sizes = [len(jobs) // n_chunks] * n_chunks
+    for i in range(len(jobs) % n_chunks):
+        chunk_sizes[i] += 1
+
+    chunks = []
+    start = 0
+    for size in chunk_sizes:
+        chunks.append(jobs[start:start + size])
+        start += size
+    return chunks
+
+
 def get_available_gpus(min_free_mem_gb=4):
     """Returns a list of GPU IDs with at least min_free_mem_gb available."""
     result = subprocess.run(
@@ -64,8 +78,8 @@ def train(model, device, train_loader, optimizer, epoch,
         if scheduler is not None:
             scheduler.step()
     train_loss /= len(train_loader.dataset)
-    print('\nEpoch {} Train set: Average loss: {:.4f}\n'.format(
-        epoch, train_loss, correct, len(train_loader.dataset)))
+    # print('\nEpoch {} Train set: Average loss: {:.4f}\n'.format(
+    #     epoch, train_loss, correct, len(train_loader.dataset)))
     return train_loss
 
 class MLP(nn.Module):
@@ -115,7 +129,8 @@ class muMLP(nn.Module):
 
 
 
-def run_jobs_on_gpu(gpu_id, jobs, return_dict):
+def run_jobs_on_gpu(gpu_id, uid, jobs, return_dict, shared_tensor_of_epochs):
+    shared_tensor_of_epochs[uid] = 0
     nonlin = torch.relu
     criterion = F.cross_entropy
     torch.manual_seed(1)
@@ -130,7 +145,7 @@ def run_jobs_on_gpu(gpu_id, jobs, return_dict):
     output_mult = 32
     input_mult = 0.00390625
 
-    print(f'[{gpu_id}] loading data', flush=True)
+    print(f"[{gpu_id}:{uid}] Loading CIFAR-10 dataset", flush=True)
     transform = transforms.Compose(
             [transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
@@ -146,13 +161,12 @@ def run_jobs_on_gpu(gpu_id, jobs, return_dict):
     device = torch.device(f'cuda:{gpu_id}')
     local_logs = []
     for width, log2lr in jobs:
-        torch.manual_seed(1)
         try:
             mynet = muMLP(width=width, nonlin=nonlin, output_mult=output_mult, input_mult=input_mult).to(device)
         except Exception as e:
             print(f'[{gpu_id}] Error creating model: {e}', flush=True)
 
-        print(f'[{gpu_id}] loading base shapes from {base_shapes_path}', flush=True)
+        print(f"[{gpu_id}:{uid}] Training muP MLP with width {width} and log2lr {log2lr}, allocated process memory {torch.cuda.memory_allocated(gpu_id)/1024**3:.2f} GB", flush=True)
         set_base_shapes(mynet, base_shapes_path)
 
         optimizer = MuSGD(mynet.parameters(), lr=2**log2lr)
@@ -166,12 +180,18 @@ def run_jobs_on_gpu(gpu_id, jobs, return_dict):
                 log2lr=log2lr,
                 train_loss=train_loss,
                 width=width,
+                gpu_id=gpu_id,
+                uid=uid,
             ))
 
             if math.isnan(train_loss):
+                print(f"[{gpu_id}:{uid}] NaN loss at epoch {epoch}, width {width}, log2lr {log2lr}", flush=True)
+                shared_tensor_of_epochs[uid] = torch.nan
                 break
 
-    return_dict[gpu_id] = local_logs
+            shared_tensor_of_epochs[uid] = epoch
+
+    return_dict[uid] = local_logs
 
 if __name__ == '__main__':
     data_dir = '/tmp'
@@ -190,12 +210,13 @@ if __name__ == '__main__':
 
     # muP MLP
     widths = [256, 512, 1024, 2048, 4096, 8192]
-    log2lrs = np.linspace(-8, 0, 10)
+    log2lrs = np.linspace(-8, 0, 20)
     combos = list(itertools.product(widths, log2lrs))
 
     gpus = get_available_gpus(min_free_mem_gb=40)
     print(f'Available GPUs: {gpus}')
     n_gpus = len(gpus)+1
+    copies = 20
     jobs_split = [combos[i::n_gpus] for i in range(n_gpus)]
 
     mp.set_start_method('spawn', force=True)
@@ -203,11 +224,23 @@ if __name__ == '__main__':
     return_dict = manager.dict()
     processes = []
 
-    for job_id, gpu_id in enumerate(gpus):
-        p = mp.Process(target=run_jobs_on_gpu, args=(gpu_id, jobs_split[job_id], return_dict))
-        print(f'Starting process {gpu_id} with {len(jobs_split[job_id])} jobs')
+    jobs_per_worker = chunk_jobs(combos, n_gpus * copies)
+    gpu_ids = [gpu for gpu in gpus for _ in range(copies)]
+
+    shared_tensor_of_epochs = (-1) * torch.ones(copies*len(gpus), dtype=torch.float32)
+    jobst = 0
+    for uid, (gpu_id, joblist) in enumerate(zip(gpu_ids, jobs_per_worker)):
+        if len(joblist) == 0:
+            print(f'[{gpu_id}:{uid}] No jobs to run', flush=True)
+            continue
+        p = mp.Process(target=run_jobs_on_gpu, args=(gpu_id, uid, joblist, return_dict, shared_tensor_of_epochs))
+        print(f'Starting GPU {gpu_id}:{uid} with {len(joblist)} jobs', flush=True)
         p.start()
         processes.append(p)
+
+    while any(p.is_alive() for p in processes):
+        print(shared_tensor_of_epochs.reshape(10, -1), flush=True)
+        time.sleep(10)
 
     for p in processes:
         p.join()
@@ -216,10 +249,10 @@ if __name__ == '__main__':
     logs = []
     for gpu_logs in return_dict.values():
         logs.extend(gpu_logs)
-
-    # Optionally sort by width/log2lr/epoch if needed
     logs.sort(key=lambda x: (x['width'], x['log2lr'], x['epoch']))
 
     import json
     with open('mup_mlp_logs.json', 'w') as f:
         json.dump(logs, f, indent=4)
+
+    print(f"Finished training {len(logs)} models", flush=True)
