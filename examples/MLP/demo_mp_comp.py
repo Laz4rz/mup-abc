@@ -117,8 +117,10 @@ class muMLP(nn.Module):
         self.reset_parameters()
     
     def reset_parameters(self):
+        torch.manual_seed(1)
         nn.init.kaiming_normal_(self.fc_1.weight, a=1, mode='fan_in')
         self.fc_1.weight.data /= self.input_mult**0.5
+        torch.manual_seed(1)
         nn.init.kaiming_normal_(self.fc_2.weight, a=1, mode='fan_in')
         nn.init.zeros_(self.fc_3.weight)
 
@@ -151,7 +153,8 @@ class AbcLinear(nn.Module):
 
     def reset_parameters(self):
         print(f"resetting parameters with a={self.a}, b={self.b}")
-        std = 1 / (self.n_infty ** (-self.b))
+        torch.manual_seed(1)
+        std = 1 * (self.n_infty ** (-self.b))
         with torch.no_grad():
             self.weight.normal_(0.0, std)
             if self.bias is not None:
@@ -180,7 +183,7 @@ class AbcMLP(nn.Module):
         (a1,b1), (a2,b2), (a3,b3) = a_b_list
 
         self.act      = act_fn
-        self.fc_1      = AbcLinear(32*32*3, width, a=a1, b=b1, bias=False, use_fan_in=False)
+        self.fc_1      = AbcLinear(32*32*3, width, a=a1, b=b1, bias=False, use_fan_in=True)
         self.fc_2      = AbcLinear(width,     width, a=a2, b=b2, bias=False, use_fan_in=True)
         self.readout  = AbcLinear(width,        10, a=a3, b=b3, bias=False, use_fan_in=True)
 
@@ -424,10 +427,16 @@ if __name__ == '__main__':
         print(f"abcH1: {abcH1.mean()}, muH1: {muH1.mean()}")
         print(f"abcH2: {abcH2.mean()}, muH2: {muH2.mean()}")
 
+    print()
     # no-forward forward pass
     with torch.no_grad():
         abcZ1 = abcModel.fc_1.weight @ sample.T * input_mult ** 0.5
         muZ1 = muModel.fc_1.weight @ sample.T * muModel.input_mult**0.5
 
+        abcZ2 = abcModel.fc_2.weight @ abcZ1
+        muZ2 = muModel.fc_2.weight @ muZ1
+
         print(f"abcZ1: {abcZ1.mean()}, muZ1: {muZ1.mean()}")
         print(f"std(abcZ1): {abcZ1.std()}, std(muZ1): {muZ1.std()}")
+        print(f"abcZ2: {abcZ2.mean()}, muZ2: {muZ2.mean()}")
+        print(f"std(abcZ2): {abcZ2.std()}, std(muZ2): {muZ2.std()}")
