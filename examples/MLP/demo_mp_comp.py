@@ -118,16 +118,11 @@ class muMLP(nn.Module):
     
     def reset_parameters(self):
         nn.init.kaiming_normal_(self.fc_1.weight, a=1, mode='fan_in')
-        # scaling down the weights according to Table 1 (a=-1/2)
-        # for whatever reason this is only done on this learned HP
         self.fc_1.weight.data /= self.input_mult**0.5
-        # second layer is not scaled, a=0
         nn.init.kaiming_normal_(self.fc_2.weight, a=1, mode='fan_in')
-        # readout layer is treated as bias (zero init) layer (TP5 appendix)
         nn.init.zeros_(self.fc_3.weight)
 
     def forward(self, x):
-        # scaling the first layer output back up to the original scale of (a=-1/2)
         out = self.nonlin(self.fc_1(x) * self.input_mult**0.5)
         out = self.nonlin(self.fc_2(out))
         return self.fc_3(out)
@@ -155,7 +150,8 @@ class AbcLinear(nn.Module):
         self.weight.n_infty = self.n_infty       # for optimizer
 
     def reset_parameters(self):
-        std = self.n_infty ** (-self.b)
+        print(f"resetting parameters with a={self.a}, b={self.b}")
+        std = 1 / (self.n_infty ** (-self.b))
         with torch.no_grad():
             self.weight.normal_(0.0, std)
             if self.bias is not None:
@@ -184,8 +180,8 @@ class AbcMLP(nn.Module):
         (a1,b1), (a2,b2), (a3,b3) = a_b_list
 
         self.act      = act_fn
-        self.fc1      = AbcLinear(32*32*3, width, a=a1, b=b1, bias=False, use_fan_in=False)
-        self.fc2      = AbcLinear(width,     width, a=a2, b=b2, bias=False, use_fan_in=True)
+        self.fc_1      = AbcLinear(32*32*3, width, a=a1, b=b1, bias=False, use_fan_in=False)
+        self.fc_2      = AbcLinear(width,     width, a=a2, b=b2, bias=False, use_fan_in=True)
         self.readout  = AbcLinear(width,        10, a=a3, b=b3, bias=False, use_fan_in=True)
 
         # optional: start with *exactly zero* logits (classic μP trick)
@@ -196,12 +192,11 @@ class AbcMLP(nn.Module):
     
     def reset_parameters(self):
         with torch.no_grad():
-            self.fc1.weight.data /= 0.00390625 ** 0.5
+            self.fc_1.weight.data /= 0.00390625 ** 0.5
 
     def forward(self, x):
-        x  = x.flatten(1)           # B × 3072
-        h1 = self.act(self.fc1(x) * 0.00390625 ** 0.5)
-        h2 = self.act(self.fc2(h1))
+        h1 = self.act(self.fc_1(x) * 0.00390625 ** 0.5)
+        h2 = self.act(self.fc_2(h1))
         return self.readout(h2) * 32
 
 def make_abc_sgd(model, base_lr: float = 0.1, c: float = 0.0, momentum=0.9):
@@ -222,7 +217,7 @@ def make_abc_sgd(model, base_lr: float = 0.1, c: float = 0.0, momentum=0.9):
     return torch.optim.SGD(param_groups)    
 
 def abc_run_jobs_on_gpu(gpu_id, uid, jobs, return_dict, shared_tensor_of_epochs, shared_tensor_of_losses):
-    abc_defaults = [(0,0), (0,0.5), (0,0.5)]
+    abc_defaults = [(0,5), (0,0.5), (0,0.5)]
     shared_tensor_of_epochs[uid] = 0
     shared_tensor_of_losses[uid] = 0
     nonlin = torch.relu
@@ -370,48 +365,69 @@ if __name__ == '__main__':
     log2lrs = np.linspace(-8, 0, 20)
     combos = list(itertools.product(widths, log2lrs))
 
-    gpus = get_available_gpus(min_free_mem_gb=25)
-    print(f'Available GPUs: {gpus}')
-    n_gpus = len(gpus)+1
-    copies = 1
-    jobs_split = [combos[i::n_gpus] for i in range(n_gpus)]
+    torch.manual_seed(1)
+    muModel = muMLP(width=256, nonlin=nonlin, output_mult=32, input_mult=0.00390625)
+    torch.manual_seed(1)
+    set_base_shapes(muModel, base_shapes_path)
+    abcModel = AbcMLP(width=256, a_b_list=[(-0.5,0.5), (0,0.5), (0.5,0.5)], act_fn=nonlin)
 
-    mp.set_start_method('spawn', force=True)
-    manager = mp.Manager()
-    return_dict = manager.dict()
-    processes = []
+    muOpt = MuSGD(muModel.parameters(), lr=0.1)
+    abcOpt = make_abc_sgd(abcModel, base_lr=0.1, c=0.0, momentum=0)
 
-    jobs_per_worker = chunk_jobs(combos, n_gpus * copies)
-    gpu_ids = [gpu for gpu in gpus for _ in range(copies)]
+    batch_size = 1
+    transform = transforms.Compose(
+            [transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+    trainset = datasets.CIFAR10(root=data_dir, train=True,
+                                            download=True, transform=transform)
+    train_loader = torch.utils.data.DataLoader(trainset, batch_size=batch_size,
+                                            shuffle=True, num_workers=1)
+    
+    output_mult = 32
+    input_mult = 0.00390625
 
-    shared_tensor_of_epochs = (-1) * torch.ones(copies*len(gpus), dtype=torch.float32)
-    shared_tensor_of_losses = (-1) * torch.ones(copies*len(gpus), dtype=torch.float32)
-    jobst = 0
-    for uid, (gpu_id, joblist) in enumerate(zip(gpu_ids, jobs_per_worker)):
-        if len(joblist) == 0:
-            print(f'[{gpu_id}:{uid}] No jobs to run', flush=True)
-            continue
-        p = mp.Process(target=abc_run_jobs_on_gpu, args=(gpu_id, uid, joblist, return_dict, shared_tensor_of_epochs, shared_tensor_of_losses))
-        print(f'Starting GPU {gpu_id}:{uid} with {len(joblist)} jobs', flush=True)
-        p.start()
-        processes.append(p)
+    sample = torch.tensor(train_loader.dataset.data[0].reshape(1, 3, 32, 32)).float().flatten(1)
 
-    while any(p.is_alive() for p in processes):
-        print(shared_tensor_of_epochs.reshape(10, -1), flush=True)
-        print(shared_tensor_of_losses.reshape(10, -1), flush=True)
-        time.sleep(10)
+    muForward = muModel(sample)
+    abcForward = abcModel(sample)
 
-    for p in processes:
-        p.join()
+    muLoss = F.cross_entropy(muForward, torch.tensor([train_loader.dataset.targets[0]]))
+    abcLoss = F.cross_entropy(abcForward, torch.tensor([train_loader.dataset.targets[0]]))
 
-    # Combine logs from all GPUs
-    logs = []
-    for gpu_logs in return_dict.values():
-        logs.extend(gpu_logs)
-    logs.sort(key=lambda x: (x['width'], x['log2lr'], x['epoch']))
+    muModel.zero_grad()
+    abcModel.zero_grad()
 
-    import json
-    with open('abc_mlp_logs.json', 'w') as f:
-        json.dump(logs, f, indent=4)
+    muLoss.backward()
+    abcLoss.backward()
 
-    print(f"Finished training {len(logs)} models", flush=True)
+    # print gradients
+    muGrads = [p.grad for p in muModel.parameters()]
+    abcGrads = [p.grad for p in abcModel.parameters()]
+
+    with torch.no_grad():
+        for muGrad, abcGrad in zip(muGrads, abcGrads):
+            print(f"muP grad: {muGrad.mean()}, abc grad: {abcGrad.mean()}")
+            print(f"muP grad: {muGrad.std()}, abc grad: {abcGrad.std()}")
+
+    # simulate forward pass
+    with torch.no_grad():
+        abcZ1 = abcModel.fc_1(sample) * input_mult ** 0.5
+        muZ1 = muModel.fc_1(sample) * muModel.input_mult**0.5
+
+        abcH1 = abcModel.act(abcModel.fc_1(sample) * input_mult ** 0.5)
+        muH1 = muModel.nonlin(muModel.fc_1(sample) * muModel.input_mult**0.5)
+
+        abcH2 = abcModel.act(abcModel.fc_2(abcH1))
+        muH2 = muModel.nonlin(muModel.fc_2(muH1))
+
+        print(f"abcZ1: {abcZ1.mean()}, muZ1: {muZ1.mean()}")
+        print(f"abcH1: {abcH1.mean()}, muH1: {muH1.mean()}")
+        print(f"abcH2: {abcH2.mean()}, muH2: {muH2.mean()}")
+
+    # no-forward forward pass
+    with torch.no_grad():
+        abcZ1 = abcModel.fc_1.weight @ sample.T * input_mult ** 0.5
+        muZ1 = muModel.fc_1.weight @ sample.T * muModel.input_mult**0.5
+
+        print(f"abcZ1: {abcZ1.mean()}, muZ1: {muZ1.mean()}")
+        print(f"std(abcZ1): {abcZ1.std()}, std(muZ1): {muZ1.std()}")
