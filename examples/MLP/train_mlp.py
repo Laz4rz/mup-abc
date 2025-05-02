@@ -1,4 +1,4 @@
-import sys
+import math
 from time import sleep
 import subprocess
 import itertools
@@ -26,7 +26,7 @@ def chunk_jobs(jobs, n_chunks):
     for size in chunk_sizes:
         chunk = []
         for job in jobs[start:start + size]:
-            chunk.append((idx, job[0], job[1]))  # actually tag the job
+            chunk.append((idx, job[0], job[1]))
             idx += 1
         chunks.append(chunk)
         start += size
@@ -47,6 +47,36 @@ def get_available_gpus(min_free_mem_gb=4):
     free_memories = [int(x) for x in result.stdout.strip().split('\n')]
     return [i for i, mem in enumerate(free_memories) if mem >= min_free_mem_gb * 1024]
 
+
+def get_available_gpus(min_free_mem_gb=4, max_utilization=10):
+    result = subprocess.run(
+        [
+            'nvidia-smi',
+            '--query-gpu=memory.total,memory.used,utilization.gpu',
+            '--format=csv,nounits,noheader'
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"nvidia-smi failed: {result.stderr}")
+
+    available_gpus = []
+    for i, line in enumerate(result.stdout.strip().split('\n')):
+        total_str, used_str, util_str = map(str.strip, line.split(','))
+        total = int(total_str)  # in MB
+        used = int(used_str)    # in MB
+        util = int(util_str)    # in %
+
+        free_mem_gb = (total - used) / 1024
+        if free_mem_gb >= min_free_mem_gb and util < max_utilization:
+            available_gpus.append(i)
+
+    return available_gpus
+
+
 def preload_subset(batch_size, subset_percentage):
     transform = transforms.Compose([
     transforms.ToTensor(),
@@ -65,7 +95,53 @@ def preload_subset(batch_size, subset_percentage):
     preloaded = torch.utils.data.DataLoader(preloaded_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     return preloaded
 
+class NTK_MLP(nn.Module):
+    """Initialized according to Table1 from TP4 -- the most similar training behavior to the plots"""
+    def __init__(self, width=128, num_classes=10):
+        super().__init__()
+        self.width = width
+        self.fc_1 = nn.Linear(3072, width, bias=False)
+        self.fc_2 = nn.Linear(width,  width,  bias=False)
+        self.fc_3 = nn.Linear(width,  num_classes, bias=False)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.normal_(self.fc_1.weight, std=1.0)
+        nn.init.normal_(self.fc_2.weight, std=self.width**(-0.5))
+        nn.init.normal_(self.fc_3.weight, std=self.width**(-0.5))
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        h = F.relu(self.fc_1(x))
+        h = F.relu(self.fc_2(h))
+        return self.fc_3(h)
+
+class demoMLP(nn.Module):
+    """SP model from the muP demo example jupyternotebook -- doesnt show expected train behavior"""
+    def __init__(self, width=128, num_classes=10, nonlin=F.relu, output_mult=1.0, input_mult=1.0):
+        super().__init__()
+        self.nonlin = nonlin
+        self.input_mult = input_mult
+        self.output_mult = output_mult
+        self.fc_1 = nn.Linear(3072, width, bias=False)
+        self.fc_2 = nn.Linear(width, width, bias=False)
+        self.fc_3 = nn.Linear(width, num_classes, bias=False)
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        nn.init.kaiming_normal_(self.fc_1.weight, a=1, mode='fan_in')
+        self.fc_1.weight.data /= self.input_mult**0.5
+        nn.init.kaiming_normal_(self.fc_2.weight, a=1, mode='fan_in')
+        nn.init.zeros_(self.fc_3.weight)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        out = self.nonlin(self.fc_1(x) * self.input_mult**0.5)
+        out = self.nonlin(self.fc_2(out))
+        return self.fc_3(out) * self.output_mult
+
 class MLP(nn.Module):
+    """Standard MLP model -- does not show SP expected training behavior"""
     def __init__(self, width=128, num_classes=10):
         super().__init__()
         self.width = width
@@ -83,6 +159,7 @@ class MLP(nn.Module):
         return h
     
 class muMLPTab9(nn.Module):
+    """muP initialized MLP model, according to Table9 from TP5 (thanks to dvruette)"""
     def __init__(self, width=128, num_classes=10):
         super().__init__()
         self.width = width
@@ -94,7 +171,7 @@ class muMLPTab9(nn.Module):
         self.reset_parameters()
     
     def reset_parameters(self):
-        nn.init.normal_(self.fc_1.weight, std=(self.width*3072)**-0.5)
+        nn.init.normal_(self.fc_1.weight, std=self.width**-0.5) # ? 1/fanout
         nn.init.normal_(self.fc_2.weight, std=self.width**-0.5)
         nn.init.normal_(self.fc_3.weight, std=self.width**-0.5)
 
@@ -117,6 +194,7 @@ def train(model, train_dl, optimizer, num_epochs, device):
             train_loss += loss.item() * data.size(0)
             loss.backward()
             optimizer.step()
+        
     return train_loss / len(train_dl.dataset)
 
 def run_chunk(jobs, device, shared_tensor, preloaded, seeds, model_class, epochs):
@@ -148,7 +226,7 @@ if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
 
     parser = argparse.ArgumentParser(description="Train MLP or muMLP model.")
-    parser.add_argument('--model', type=str, choices=['MLP', 'muMLP'], required=True, help="Choose the model type: 'MLP' or 'muMLP'")
+    parser.add_argument('--model', type=str, choices=['MLP', 'muMLP', 'demoMLP', 'NTKMLP'], required=True, help="Choose the model type: 'MLP', 'muMLP', 'NTK_MLP' or 'demoMLP'")
     parser.add_argument('--subset', type=float, default=0.2, help="Percentage of dataset to use for training (default: 0.2)")
     args = parser.parse_args()
 
@@ -156,12 +234,17 @@ if __name__ == '__main__':
         model_class = MLP
     elif args.model == 'muMLP':
         model_class = muMLPTab9
+    elif args.model == 'demoMLP':
+        model_class = demoMLP
+    elif args.model == 'NTKMLP':
+        model_class = NTK_MLP
     else:
         raise ValueError("Invalid model type. Choose 'MLP' or 'muMLP'.")
     print(f"Using model: {args.model}, subset: {args.subset*100}%")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 64
+    batch_size = 2048
     data_dir = '/tmp'
 
     preloaded = preload_subset(batch_size, args.subset)
@@ -170,12 +253,14 @@ if __name__ == '__main__':
     epochs = 20
     seeds = [47]
     # seeds = [0, 1, 2, 3, 4]
-    log2lrs = np.linspace(-8, 0, 20)
-    widths = [128, 512, 2048, 8192] 
+    log2lrs = np.linspace(-12, 0, 40)
+    widths = [128, 256, 512, 1024, 2048, 4096, 8192] 
     # widths = [128]
 
-    devices = [f"cuda:{i}" for i in get_available_gpus(min_free_mem_gb=8)]
-    print(f"Available devices: {len(devices)}, {[d.split(':')[-1] for d in devices]}")
+    availage_gpus = get_available_gpus(min_free_mem_gb=16, max_utilization=50)
+    availage_gpus = [0, 3, 5, 6, 7]
+    devices = [f"cuda:{i}" for i in availage_gpus]
+    print(f"Available devices: {len(devices)}, {availage_gpus}")
 
     jobs = list(itertools.product(log2lrs, widths))
     jobs_chunks = chunk_jobs(jobs, len(devices))
