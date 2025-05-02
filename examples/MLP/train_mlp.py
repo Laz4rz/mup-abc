@@ -244,7 +244,6 @@ if __name__ == '__main__':
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 64
-    batch_size = 2048
     data_dir = '/tmp'
 
     preloaded = preload_subset(batch_size, args.subset)
